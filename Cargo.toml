@@ -1,0 +1,12 @@
+[profile.dev]
+overflow-checks = false
+
+[profile.release]
+overflow-checks = false
+
+[workspace]
+resolver = "2"
+members = [
+    "src/maintask",
+    "src/pretask"
+]
