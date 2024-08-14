@@ -4,7 +4,7 @@ mod ntt;
 
 use std::array;
 use std::f64::consts::PI;
-use std::ops::{Add, DerefMut, Sub};
+use std::ops::{Add, DerefMut, Mul, Sub};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use arrayref::array_ref;
@@ -37,16 +37,21 @@ fn  main() {
         let timer = std::time::Instant::now();
         let v0 = (itr & 1) == 0;
         let v1 = (itr & 2) == 0;
+        let v2 = (itr & 4) == 0;
         let mut rng = ChaChaRng::from_entropy();
         let s0 = gen_s::<n>(&mut rng);
         let s1 = gen_s::<kN>(&mut rng);
         let ct1 = encrypt(v0, &s1);
         let ct2 = encrypt(v1, &s1);
-        let ct3 = hom_nand(&ct1, &ct2, &gen_bk(s0, s1), gen_ks(s0, s1));
-        let pt0 = decryptlv1(&ct3, &s1);
-        let pt = decrypt(&ct3, &s1);
-        assert_eq!(!(v0 & v1), pt);
-        println!("{:?}: {:?} nand {:?} = {:?} ({:016b})", itr, v0, v1, pt, pt0);
+        let ct3 = encrypt(v2, &s1);
+        let bk = gen_bk(s0, s1);
+        let ks = gen_ks(s0, s1);
+        let (ct_s, ct_c) = hom_full_adder(&ct1, &ct2, &ct3, &bk, &ks);
+        let pt_s = decrypt(&ct_s, &s1);
+        let pt_c = decrypt(&ct_c, &s1);
+        assert_eq!(v0 ^ v1 ^ v2, pt_s);
+        assert_eq!((v0 & v1) | (v0 & v2) | (v1 & v2), pt_c);
+        println!("{:?}: {:?} + {:?} + {:?} = {:?} {:?}", itr, v0, v1, v2, pt_c, pt_s);
         println!("{:?}", timer.elapsed());
     }
 }
@@ -205,8 +210,8 @@ fn external_product(c: &TRGSW, trlwe: &TRLWE) -> TRLWE {
 
 #[test]
 fn test_external_product() {
+    let mut rng = ChaChaRng::from_entropy();
     for val in [0, 1] {
-        let mut rng = ChaChaRng::from_entropy();
         let s = gen_s::<kN>(&mut rng);
         let mut pt = [0; N];
         for i in 0..N {
@@ -227,7 +232,7 @@ fn cmux(trgsw: &TRGSW, trlwe1: &TRLWE, trlwe0: &TRLWE) -> TRLWE {
     &external_product(trgsw, &(trlwe1 - trlwe0)) + trlwe0
 }
 
-fn blind_rotate(tlwe: &TLWELv0, bk: &[TRGSW; n], test_vec: &TRLWE) -> TRLWE {
+fn blind_rotate(tlwe: &TLWELv0, bk: &BKey, test_vec: &TRLWE) -> TRLWE {
     let sh = 16 - Nbit - 1;
     let b = (tlwe.b >> sh) as isize;
     let mut acc = test_vec.mul_x(-b);
@@ -240,8 +245,8 @@ fn blind_rotate(tlwe: &TLWELv0, bk: &[TRGSW; n], test_vec: &TRLWE) -> TRLWE {
 
 #[test]
 fn test_blind_rotate() {
+    let mut rng = ChaChaRng::from_entropy();
     for (val, expect) in [(MU16, MU32), (3 * MU16, MU32), (5 * MU16, 7 * MU32), (7 * MU16, 7 * MU32)] {
-        let mut rng = ChaChaRng::from_entropy();
         let test_vec = TRLWE::new_test_vec();
         let s0 = gen_s::<n>(&mut rng);
         let s1 = gen_s::<kN>(&mut rng);
@@ -253,7 +258,7 @@ fn test_blind_rotate() {
     }
 }
 
-fn gate_bootstrapping_tlwe_to_tlwe(tlwe: &TLWELv0, bk: &[TRGSW; n]) -> TLWELv1 {
+fn gate_bootstrapping_tlwe_to_tlwe(tlwe: &TLWELv0, bk: &BKey) -> TLWELv1 {
     let test_vec = TRLWE::new_test_vec();
     let trlwe = blind_rotate(tlwe, bk, &test_vec);
     sample_extract_index(&trlwe, 0)
@@ -261,8 +266,8 @@ fn gate_bootstrapping_tlwe_to_tlwe(tlwe: &TLWELv0, bk: &[TRGSW; n]) -> TLWELv1 {
 
 #[test]
 fn test_gate_bootstrapping_tlwe_to_tlwe() {
+    let mut rng = ChaChaRng::from_entropy();
     for (val, expected) in [(MU16, MU16), (3 * MU16, MU16), (5 * MU16, 7 * MU16), (7 * MU16, 7 * MU16)] {
-        let mut rng = ChaChaRng::from_entropy();
         let s0 = gen_s::<n>(&mut rng);
         let s1 = gen_s::<kN>(&mut rng);
         let bk = gen_bk(s0, s1);
@@ -273,7 +278,7 @@ fn test_gate_bootstrapping_tlwe_to_tlwe() {
     }
 }
 
-fn identity_key_switching(tlwe: &TLWELv1, ks: [[[Box<TLWELv0>; base/2]; t]; kN]) -> TLWELv0 {
+fn identity_key_switching(tlwe: &TLWELv1, ks: &KSKey) -> TLWELv0 {
     let mut r = TLWELv0::new([0; n], torus32_to_16(tlwe.b));
     for i in 0..kN {
         let a2 = tlwe.a[i] as i64 + (1 << (31 - t * basebit)) + 0xaa800000;
@@ -291,43 +296,76 @@ fn identity_key_switching(tlwe: &TLWELv1, ks: [[[Box<TLWELv0>; base/2]; t]; kN])
 
 #[test]
 fn test_identity_key_switching() {
+    let mut rng = ChaChaRng::from_entropy();
     for val in [MU32, 3 * MU32, 5 * MU32, 7 * MU32] {
-        let mut rng = ChaChaRng::from_entropy();
         let s0 = gen_s::<n>(&mut rng);
         let s1 = gen_s::<kN>(&mut rng);
         let ks = gen_ks(s0, s1);
         let lv1 = encrypt_lv1(val, &s1);
-        let lv0 = identity_key_switching(&lv1, ks);
+        let lv0 = identity_key_switching(&lv1, &ks);
         let dec0 = decryptlv0(&lv0, &s0);
         assert_torus16_eq(dec0, torus32_to_16(val), 11);
     }
 }
 
-fn hom_nand(x: &TLWELv1, y: &TLWELv1, bk: &[TRGSW; n], ks: [[[Box<TLWELv0>; base/2]; t]; kN]) -> TLWELv1 {
-    let lv1 = &(&TLWELv1::new_mu() - x) - y;
+fn hom_nand(x: &TLWELv1, y: &TLWELv1, bk: &BKey, ks: &KSKey) -> TLWELv1 {
+    let lv1 = &(&TLWELv1::new_const(MU32) - x) - y;
     let lv0 = identity_key_switching(&lv1, ks);
     gate_bootstrapping_tlwe_to_tlwe(&lv0, bk)
 }
+fn hom_and(x: &TLWELv1, y: &TLWELv1, bk: &BKey, ks: &KSKey) -> TLWELv1 {
+    let lv1 = &(x + y) - &TLWELv1::new_const(MU32);
+    let lv0 = identity_key_switching(&lv1, ks);
+    gate_bootstrapping_tlwe_to_tlwe(&lv0, bk)
+}
+fn hom_or(x: &TLWELv1, y: &TLWELv1, bk: &BKey, ks: &KSKey) -> TLWELv1 {
+    let lv1 = &(x + y) + &TLWELv1::new_const(MU32);
+    let lv0 = identity_key_switching(&lv1, ks);
+    gate_bootstrapping_tlwe_to_tlwe(&lv0, bk)
+}
+fn hom_xor(x: &TLWELv1, y: &TLWELv1, bk: &BKey, ks: &KSKey) -> TLWELv1 {
+    let lv1 = &(&(x + y) + &TLWELv1::new_const(MU32)) * 2;
+    let lv0 = identity_key_switching(&lv1, ks);
+    gate_bootstrapping_tlwe_to_tlwe(&lv0, bk)
+}
+fn hom_full_adder(x: &TLWELv1, y: &TLWELv1, c0: &TLWELv1, bk: &BKey, ks: &KSKey) -> (TLWELv1, TLWELv1) {
+    let xor = hom_xor(x, y, bk, ks);
+    let s = hom_xor(&xor, c0, bk, ks);
+    let t1 = hom_and(&xor, c0, bk, ks);
+    let t2 = hom_and(x, y, bk, ks);
+    let c1 = hom_or(&t1, &t2, bk, ks);
+    (s, c1)
+}
 
 #[test]
-fn test_hom_nand() {
-    for (v0, v1) in [(false, false), (false, true), (true, false), (true, true)] {
-        let mut rng = ChaChaRng::from_entropy();
-        let s0 = gen_s::<n>(&mut rng);
-        let s1 = gen_s::<kN>(&mut rng);
-        let ct1 = encrypt(v0, &s1);
-        let ct2 = encrypt(v1, &s1);
-        let ct3 = hom_nand(&ct1, &ct2, &gen_bk(s0, s1), gen_ks(s0, s1));
-        let pt = decrypt(&ct3, &s1);
-        assert_eq!(!(v0 & v1), pt);
+fn test_hom_op() {
+    let mut rng = ChaChaRng::from_entropy();
+    let s0 = gen_s::<n>(&mut rng);
+    let s1 = gen_s::<kN>(&mut rng);
+    let bk = gen_bk(s0, s1);
+    let ks = gen_ks(s0, s1);
+    let ops: &[(fn (bool, bool) -> bool, fn (&TLWELv1, &TLWELv1, &BKey, &KSKey) -> TLWELv1)] = &[
+        (|x, y| !(x & y), hom_nand),
+        (|x, y| x & y, hom_and),
+        (|x, y| x | y, hom_or),
+        (|x, y| x ^ y, hom_xor)
+    ];
+    for (op, func) in ops {
+        for (v1, v2) in [(false, false), (false, true), (true, false), (true, true)] {
+            let ct1 = encrypt(v1, &s1);
+            let ct2 = encrypt(v2, &s1);
+            let ct3 = func(&ct1, &ct2, &bk, &ks);
+            let pt = decrypt(&ct3, &s1);
+            assert_eq!(op(v1, v2), pt);
+        }
     }
 }
 
-fn gen_bk(s0: [bool; n], s1: [bool; kN]) -> [TRGSW; n] {
+fn gen_bk(s0: [bool; n], s1: [bool; kN]) -> BKey {
     s0.map(|b| TRGSW::new(b as u32, s1))
 }
 
-fn gen_ks(s0: [bool; n], s1: [bool; kN]) -> [[[Box<TLWELv0>; base/2]; t]; kN] {
+fn gen_ks(s0: [bool; n], s1: [bool; kN]) -> KSKey {
     array::from_fn(|i| {
         array::from_fn(|m| {
             let sh = 16 - (m + 1) * basebit;
@@ -396,6 +434,8 @@ fn decryptlv1(tlwe: &TLWELv1, s: &[bool; kN]) -> Torus32 {
 type Torus16 = u16;
 type Torus32 = u32;
 type TorusPoly = Box<[Torus32; N]>;
+type BKey = [TRGSW; n];
+type KSKey = [[[Box<TLWELv0>; base/2]; t]; kN];
 
 type TLWELv0 = TLWE<Torus16, n>;
 type TLWELv1 = TLWE<Torus32, kN>;
@@ -413,8 +453,8 @@ impl<T, const M: usize> TLWE<T, M> {
     }
 }
 impl<const M: usize> TLWE<Torus32, M> {
-    pub fn new_mu() -> Self {
-        Self::new([0; M], MU32)
+    pub fn new_const(x: Torus32) -> Self {
+        Self::new([0; M], x)
     }
 }
 impl<'a, 'b, T, const M: usize> Add<&'b TLWE<T, M>> for &'a TLWE<T, M> where T: Unsigned + Copy + Default {
@@ -437,6 +477,17 @@ impl<'a, 'b, T, const M: usize> Sub<&'b TLWE<T, M>> for &'a TLWE<T, M> where T: 
             a[i] = self.a[i] - rhs.a[i];
         }
         TLWE::new(a, self.b - rhs.b)
+    }
+}
+impl<'a, T, const M: usize> Mul<T> for &'a TLWE<T, M> where T: Unsigned + Copy + Default {
+    type Output = TLWE<T, M>;
+
+    fn mul(self, rhs: T) -> Self::Output {
+        let mut a = [T::default(); M];
+        for i in 0..M {
+            a[i] = self.a[i] * rhs;
+        }
+        TLWE::new(a, self.b * rhs)
     }
 }
 
