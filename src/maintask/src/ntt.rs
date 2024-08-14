@@ -14,11 +14,21 @@ const MOD: u128 = 0x1000000000000e001;
 const R2: u128 = 0x9612ae0498038001;
 const M2: u128 = 0x7f36f589911a834e69f0ab7f3c00dfff;
 const PRIM_ROOT: u128 = 13;
+const NTH_ROOT: [Mint; 13] = {
+    let mut nth_root = [Mint::new(0); 13];
+    nth_root[12] = Mint::new(0x1f924307b4d8a243);
+    let mut i = 12;
+    while i > 0 {
+        nth_root[i - 1] = Mint(Mint::modulo(Mint::mul_reduce(nth_root[i].0, nth_root[i].0)));
+        i -= 1;
+    }
+    nth_root
+};
 
 #[derive(Clone, Copy)]
 struct Mint(u128);
 impl Mint {
-    fn new(x: u128) -> Self {
+    const fn new(x: u128) -> Self {
         Mint(Self::mul_reduce(x % MOD, R2))
     }
 
@@ -27,7 +37,7 @@ impl Mint {
         Mint(Self::mul_reduce(v, R2))
     }
 
-    fn high(x: u128, y: u128) -> u128 {
+    const fn high(x: u128, y: u128) -> u128 {
         let xh = x >> 64;
         let yh = y >> 64;
         let xl = x & 0xFFFFFFFFFFFFFFFF;
@@ -37,16 +47,16 @@ impl Mint {
         xh * yh + (a >> 64) + (b >> 64)
     }
 
-    fn reduce(x: u128) -> u128 {
+    const fn reduce(x: u128) -> u128 {
         Self::high(M2 * x, MOD) + (x != 0) as u128
     }
 
-    fn mul_reduce(x: u128, y: u128) -> u128 {
+    const fn mul_reduce(x: u128, y: u128) -> u128 {
         Self::high(x, y) + Self::high(M2 * x * y, MOD) + (x * y != 0) as u128
     }
 
-    fn modulo(x: u128) -> u128 {
-        min(x, x - MOD)
+    const fn modulo(x: u128) -> u128 {
+        if x < x - MOD { x } else { x - MOD }
     }
 
     fn pow(self, n: u128) -> Mint {
@@ -101,7 +111,7 @@ impl From<Mint> for i64 {
 }
 
 fn nth_root(n: usize) -> Mint {
-    Mint::new(PRIM_ROOT).pow((MOD - 1) / n as u128)
+    NTH_ROOT[n.ilog2() as usize]
 }
 
 fn ntt<const N: usize>(a: &mut Vec<Mint>) {
@@ -140,8 +150,9 @@ fn intt<const N: usize>(a: &mut Vec<Mint>) {
         width <<= 1;
         offset <<= 1;
     }
+    let b = Mint::new(2 * N as u128).inv();
     for i in 0..2*N {
-        a[i] = a[i] * Mint::new(2 * N as u128).inv();
+        a[i] = a[i] * b;
     }
 }
 

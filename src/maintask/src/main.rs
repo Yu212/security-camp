@@ -5,6 +5,7 @@ mod ntt;
 use std::array;
 use std::ops::{Add, Sub};
 use arrayref::array_ref;
+use num_traits::Unsigned;
 use rand::{Rng, RngCore};
 use rand::distributions::Standard;
 use rand::prelude::Distribution;
@@ -24,8 +25,9 @@ const basebit: usize = 2;
 const Nbit: usize = 9;
 const n: usize = 636;
 
-fn main() {
-    for itr in 0..100 {
+fn  main() {
+    for itr in 0..50 {
+        let timer = std::time::Instant::now();
         let v0 = (itr & 1) == 0;
         let v1 = (itr & 2) == 0;
         let mut rng = ChaChaRng::from_entropy();
@@ -36,25 +38,27 @@ fn main() {
         let ct3 = hom_nand(&ct1, &ct2, &gen_bk(s0, s1), gen_ks(s0, s1));
         let pt0 = decryptlv1(&ct3, &s1);
         let pt = decrypt(&ct3, &s1);
+        assert_eq!(!(v0 & v1), pt);
         println!("{:?}: {:?} nand {:?} = {:?} ({:016b})", itr, v0, v1, pt, pt0);
+        println!("{:?}", timer.elapsed());
     }
 }
 
-fn torus32_to_torus16(a: Torus32) -> Torus16 {
+fn torus32_to_16(a: Torus32) -> Torus16 {
     (a >> 16) as u16
 }
 
 fn sample_extract_index(trlwe: &TRLWE, x: usize) -> TLWELv1 {
     let mut a = [0; kN];
     for j in 0..=x {
-        a[j] = torus32_to_torus16(trlwe.a0[x - j]);
-        a[N + j] = torus32_to_torus16(trlwe.a1[x - j]);
+        a[j] = trlwe.a0[x - j];
+        a[N + j] = trlwe.a1[x - j];
     }
     for j in x+1..N {
-        a[j] = torus32_to_torus16(trlwe.a0[N + x - j].wrapping_neg());
-        a[N + j] = torus32_to_torus16(trlwe.a1[N + x - j].wrapping_neg());
+        a[j] = trlwe.a0[N + x - j].wrapping_neg();
+        a[N + j] = trlwe.a1[N + x - j].wrapping_neg();
     }
-    TLWELv1::new(a, torus32_to_torus16(trlwe.b[x]))
+    TLWELv1::new(a, trlwe.b[x])
 }
 
 #[test]
@@ -70,7 +74,7 @@ fn test_sample_extract_index() {
     for i in 0..N {
         let ext = sample_extract_index(&trlwe, i);
         let dec1 = decryptlv1(&ext, &s1);
-        assert_torus16_eq((dec0[i] >> 16) as u16, dec1, 11);
+        assert_torus32_eq(dec0[i], dec1, 27);
     }
 }
 
@@ -196,17 +200,17 @@ fn test_gate_bootstrapping_tlwe_to_tlwe() {
         let lv0 = encrypt_lv0(val, &s0);
         let lv1 = gate_bootstrapping_tlwe_to_tlwe(&lv0, &bk);
         let dec = decryptlv1(&lv1, &s1);
-        assert_torus16_eq(dec, expected, 11);
+        assert_torus16_eq(torus32_to_16(dec), expected, 11);
     }
 }
 
 fn identity_key_switching(tlwe: &TLWELv1, ks: [[[Box<TLWELv0>; base-1]; t]; kN]) -> TLWELv0 {
-    let mut r = TLWELv0::new([0; n], tlwe.b);
-    let mask = (base - 1) as u16;
+    let mut r = TLWELv0::new([0; n], torus32_to_16(tlwe.b));
+    let mask = (base - 1) as u32;
     for i in 0..kN {
         for m in 0..t {
-            let sh = 16 - (m + 1) * basebit;
-            let o = ((tlwe.a[i] + (1 << (15 - t * basebit))) >> sh & mask) as usize;
+            let sh = 32 - (m + 1) * basebit;
+            let o = ((tlwe.a[i] + (1 << (31 - t * basebit))) >> sh & mask) as usize;
             if o > 0 {
                 r = &r - &ks[i][m][o-1];
             }
@@ -217,7 +221,7 @@ fn identity_key_switching(tlwe: &TLWELv1, ks: [[[Box<TLWELv0>; base-1]; t]; kN])
 
 #[test]
 fn test_identity_key_switching() {
-    for val in [MU16, 3 * MU16, 5 * MU16, 7 * MU16] {
+    for val in [MU32, 3 * MU32, 5 * MU32, 7 * MU32] {
         let mut rng = ChaChaRng::from_entropy();
         let s0 = gen_s::<n>(&mut rng);
         let s1 = gen_s::<kN>(&mut rng);
@@ -225,7 +229,7 @@ fn test_identity_key_switching() {
         let lv1 = encrypt_lv1(val, &s1);
         let lv0 = identity_key_switching(&lv1, ks);
         let dec0 = decryptlv0(&lv0, &s0);
-        assert_torus16_eq(dec0, val, 11);
+        assert_torus16_eq(dec0, torus32_to_16(val), 11);
     }
 }
 
@@ -282,13 +286,13 @@ fn gen_s<const m: usize>(rng: &mut ChaChaRng) -> [bool; m] {
 
 fn encrypt(m: bool, s: &[bool; kN]) -> TLWELv1 {
     let mut rng = ChaChaRng::from_entropy();
-    let a = gen_nonce::<Torus16, kN>(&mut rng);
-    let e = gen_cbd(&mut rng) as Torus16;
-    let prod = (0..kN).filter(|&i| s[i]).map(|i| a[i]).sum::<Torus16>();
+    let a = gen_nonce::<Torus32, kN>(&mut rng);
+    let e = gen_cbd(&mut rng);
+    let prod = (0..kN).filter(|&i| s[i]).map(|i| a[i]).sum::<Torus32>();
     if m {
-        TLWELv1::new(a, prod + MU16 + e)
+        TLWELv1::new(a, prod + MU32 + e)
     } else {
-        TLWELv1::new(a, prod - MU16 + e)
+        TLWELv1::new(a, prod - MU32 + e)
     }
 }
 fn encrypt_lv0(m: Torus16, s: &[bool; n]) -> TLWELv0 {
@@ -298,24 +302,24 @@ fn encrypt_lv0(m: Torus16, s: &[bool; n]) -> TLWELv0 {
     let prod = (0..n).filter(|&i| s[i]).map(|i| a[i]).sum::<Torus16>();
     TLWELv0::new(a, prod + m + e)
 }
-fn encrypt_lv1(m: Torus16, s: &[bool; kN]) -> TLWELv1 {
+fn encrypt_lv1(m: Torus32, s: &[bool; kN]) -> TLWELv1 {
     let mut rng = ChaChaRng::from_entropy();
-    let a = gen_nonce::<Torus16, kN>(&mut rng);
-    let e = gen_cbd(&mut rng) as Torus16;
-    let prod = (0..kN).filter(|&i| s[i]).map(|i| a[i]).sum::<Torus16>();
+    let a = gen_nonce::<Torus32, kN>(&mut rng);
+    let e = gen_cbd(&mut rng);
+    let prod = (0..kN).filter(|&i| s[i]).map(|i| a[i]).sum::<Torus32>();
     TLWELv1::new(a, prod + m + e)
 }
 
 fn decrypt(tlwe: &TLWELv1, s: &[bool; kN]) -> bool {
-    let prod = (0..kN).filter(|&i| s[i]).map(|i| tlwe.a[i]).sum::<Torus16>();
-    ((tlwe.b - prod) >> 15 & 1) == 0
+    let prod = (0..kN).filter(|&i| s[i]).map(|i| tlwe.a[i]).sum::<Torus32>();
+    ((tlwe.b - prod) >> 31 & 1) == 0
 }
 fn decryptlv0(tlwe: &TLWELv0, s: &[bool; n]) -> Torus16 {
     let prod = (0..n).filter(|&i| s[i]).map(|i| tlwe.a[i]).sum::<Torus16>();
     tlwe.b - prod
 }
-fn decryptlv1(tlwe: &TLWELv1, s: &[bool; kN]) -> Torus16 {
-    let prod = (0..kN).filter(|&i| s[i]).map(|i| tlwe.a[i]).sum::<Torus16>();
+fn decryptlv1(tlwe: &TLWELv1, s: &[bool; kN]) -> Torus32 {
+    let prod = (0..kN).filter(|&i| s[i]).map(|i| tlwe.a[i]).sum::<Torus32>();
     tlwe.b - prod
 }
 
@@ -323,40 +327,47 @@ type Torus16 = u16;
 type Torus32 = u32;
 type TorusPoly = Box<[Torus32; N]>;
 
-type TLWELv0 = TLWE<n>;
-type TLWELv1 = TLWE<kN>;
+type TLWELv0 = TLWE<Torus16, n>;
+type TLWELv1 = TLWE<Torus32, kN>;
 #[derive(Debug)]
-struct TLWE<const M: usize> {
-    a: [Torus16; M],
-    b: Torus16,
+struct TLWE<T, const M: usize> {
+    a: [T; M],
+    b: T,
 }
-impl<const M: usize> TLWE<M> {
-    pub fn new(a: [Torus16; M], b: Torus16) -> Self {
+impl<T, const M: usize> TLWE<T, M> {
+    pub fn new(a: [T; M], b: T) -> Self {
         Self {
             a,
             b,
         }
     }
+}
+impl<const M: usize> TLWE<Torus16, M> {
     pub fn new_mu() -> Self {
         Self::new([0; M], MU16)
     }
 }
-impl<'a, 'b, const M: usize> Add<&'b TLWE<M>> for &'a TLWE<M> {
-    type Output = TLWE<M>;
+impl<const M: usize> TLWE<Torus32, M> {
+    pub fn new_mu() -> Self {
+        Self::new([0; M], MU32)
+    }
+}
+impl<'a, 'b, T, const M: usize> Add<&'b TLWE<T, M>> for &'a TLWE<T, M> where T: Unsigned + Copy + Default {
+    type Output = TLWE<T, M>;
 
-    fn add(self, rhs: &'b TLWE<M>) -> Self::Output {
-        let mut a = [0; M];
+    fn add(self, rhs: &'b TLWE<T, M>) -> Self::Output {
+        let mut a = [T::default(); M];
         for i in 0..M {
             a[i] = self.a[i] + rhs.a[i];
         }
         TLWE::new(a, self.b + rhs.b)
     }
 }
-impl<'a, 'b, const M: usize> Sub<&'b TLWE<M>> for &'a TLWE<M> {
-    type Output = TLWE<M>;
+impl<'a, 'b, T, const M: usize> Sub<&'b TLWE<T, M>> for &'a TLWE<T, M> where T: Unsigned + Copy + Default {
+    type Output = TLWE<T, M>;
 
-    fn sub(self, rhs: &'b TLWE<M>) -> Self::Output {
-        let mut a = [0; M];
+    fn sub(self, rhs: &'b TLWE<T, M>) -> Self::Output {
+        let mut a = [T::default(); M];
         for i in 0..M {
             a[i] = self.a[i] - rhs.a[i];
         }
@@ -475,7 +486,7 @@ impl <'a, 'b> Sub<&'b TRLWE> for &'a TRLWE {
 }
 
 struct TRGSW {
-    mat: Box<[[TorusPoly; 3]; l * 3]>,
+    mat: [[TorusPoly; 3]; l * 3],
 }
 impl TRGSW {
     pub fn new(mu: u32, s: [bool; kN]) -> Self {
@@ -489,7 +500,7 @@ impl TRGSW {
             mat[i+l+l][2][0] += mu << (24 - i * 8);
         }
         TRGSW {
-            mat: Box::new(mat),
+            mat,
         }
     }
 }
