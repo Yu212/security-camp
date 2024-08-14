@@ -23,8 +23,7 @@ const MU32: Torus32 = 1 << 29;
 const ETA: usize = 40;
 const k: usize = 2;
 const N: usize = 512;
-const h: usize = N/2;
-const kN: usize = k * N;
+const kN: usize = k*N;
 const l: usize = 2;
 const t: usize = 5;
 const base: usize = 4;
@@ -35,23 +34,23 @@ const n: usize = 636;
 fn  main() {
     for itr in 0..50 {
         let timer = std::time::Instant::now();
-        let v0 = (itr & 1) == 0;
-        let v1 = (itr & 2) == 0;
-        let v2 = (itr & 4) == 0;
+        let v1 = (itr & 1) == 0;
+        let v2 = (itr & 2) == 0;
+        let v3 = (itr & 4) == 0;
         let mut rng = ChaChaRng::from_entropy();
         let s0 = gen_s::<n>(&mut rng);
         let s1 = gen_s::<kN>(&mut rng);
-        let ct1 = encrypt(v0, &s1);
-        let ct2 = encrypt(v1, &s1);
-        let ct3 = encrypt(v2, &s1);
+        let ct1 = encrypt(v1, &s1);
+        let ct2 = encrypt(v2, &s1);
+        let ct3 = encrypt(v3, &s1);
         let bk = gen_bk(s0, s1);
         let ks = gen_ks(s0, s1);
         let (ct_s, ct_c) = hom_full_adder(&ct1, &ct2, &ct3, &bk, &ks);
         let pt_s = decrypt(&ct_s, &s1);
         let pt_c = decrypt(&ct_c, &s1);
-        assert_eq!(v0 ^ v1 ^ v2, pt_s);
-        assert_eq!((v0 & v1) | (v0 & v2) | (v1 & v2), pt_c);
-        println!("{:?}: {:?} + {:?} + {:?} = {:?} {:?}", itr, v0, v1, v2, pt_c, pt_s);
+        assert_eq!(v1 ^ v2 ^ v3, pt_s);
+        assert_eq!((v1 & v2) | (v1 & v3) | (v2 & v3), pt_c);
+        println!("{:?}: {:?} + {:?} + {:?} = {:?} {:?}", itr, v1, v2, v3, pt_c, pt_s);
         println!("{:?}", timer.elapsed());
     }
 }
@@ -82,11 +81,11 @@ fn test_sample_extract_index() {
     let bk = gen_bk(s0, s1);
     let lv0 = encrypt_lv0(MU16.wrapping_neg(), &s0);
     let trlwe = blind_rotate(&lv0, &bk, &test_vec);
-    let dec0 = trlwe.decrypt(&s1);
+    let dec1 = trlwe.decrypt(&s1);
     for i in 0..N {
         let ext = sample_extract_index(&trlwe, i);
-        let dec1 = decryptlv1(&ext, &s1);
-        assert_torus32_eq(dec0[i], dec1, 27);
+        let dec2 = decryptlv1(&ext, &s1);
+        assert_torus32_eq(dec1[i], dec2, 27);
     }
 }
 
@@ -122,7 +121,7 @@ struct FFT {
     plan: Plan,
     scratch_memory: GlobalPodBuffer,
 }
-type TorusPolyFFT = Box<[c64; h]>;
+type TorusPolyFFT = Box<[c64; N/2]>;
 impl FFT {
     fn torus32_to_f64(a: Torus32) -> f64 {
         a as f64 / 4294967296.
@@ -132,10 +131,10 @@ impl FFT {
     }
     fn fft(&mut self, a: &TorusPoly) -> TorusPolyFFT {
         let mut stack = PodStack::new(&mut self.scratch_memory);
-        let mut ac: [c64; h] = [Default::default(); h];
-        for i in 0..h {
+        let mut ac: [c64; N/2] = [Default::default(); N/2];
+        for i in 0..N/2 {
             let w = c64::cis(PI * i as f64 / N as f64);
-            ac[i] = c64::new(Self::torus32_to_f64(a[i]), Self::torus32_to_f64(a[i + h])) * w;
+            ac[i] = c64::new(Self::torus32_to_f64(a[i]), Self::torus32_to_f64(a[i + N/2])) * w;
         }
         self.plan.fwd(&mut ac, stack.rb_mut());
         Box::new(ac)
@@ -144,22 +143,22 @@ impl FFT {
         let mut stack = PodStack::new(&mut self.scratch_memory);
         self.plan.inv(ac.deref_mut(), stack.rb_mut());
         let mut c = [0; N];
-        for i in 0..h {
+        for i in 0..N/2 {
             let w = c64::cis(-PI * i as f64 / N as f64);
             ac[i] *= w;
-            c[i] = Self::f64_to_torus32(ac[i].re / h as f64);
-            c[i + h] = Self::f64_to_torus32(ac[i].im / h as f64);
+            c[i] = Self::f64_to_torus32(ac[i].re / (N/2) as f64);
+            c[i + N/2] = Self::f64_to_torus32(ac[i].im / (N/2) as f64);
         }
         Box::new(c)
     }
     fn polymul_i8(&mut self, a: &[i8; N], bc: &TorusPolyFFT) -> TorusPolyFFT {
         let mut stack = PodStack::new(&mut self.scratch_memory);
-        let mut ac: [c64; h] = array::from_fn(|i| {
+        let mut ac: [c64; N/2] = array::from_fn(|i| {
             let w = c64::cis(PI * i as f64 / N as f64);
-            c64::new(a[i] as f64, a[i + h] as f64) * w
+            c64::new(a[i] as f64, a[i + N/2] as f64) * w
         });
         self.plan.fwd(&mut ac, stack.rb_mut());
-        for i in 0..h {
+        for i in 0..N/2 {
             ac[i] = ac[i] * bc[i];
         }
         Box::new(ac)
@@ -191,14 +190,14 @@ fn external_product(c: &TRGSW, trlwe: &TRLWE) -> TRLWE {
     let a0_decomp = decomposition_poly::<l>(&trlwe.a0);
     let a1_decomp = decomposition_poly::<l>(&trlwe.a1);
     let b_decomp = decomposition_poly::<l>(&trlwe.b);
-    let mut r: [[c64; h]; 3] = [[Default::default(); h]; 3];
+    let mut r: [[c64; N/2]; 3] = [[Default::default(); N/2]; 3];
     let mut fft = FFT.lock().unwrap();
     for i in 0..3 {
         for j in 0..l {
             let mul0 = fft.polymul_i8(&a0_decomp[j], &c.mat[j][i]);
             let mul1 = fft.polymul_i8(&a1_decomp[j], &c.mat[j+l][i]);
             let mul2 = fft.polymul_i8(&b_decomp[j], &c.mat[j+l+l][i]);
-            for x in 0..h {
+            for x in 0..N/2 {
                 r[i][x] += mul0[x] + mul1[x] + mul2[x];
             }
         }
@@ -363,6 +362,25 @@ fn test_hom_op() {
     }
 }
 
+#[test]
+fn test_full_adder() {
+    for (v1, v2, v3) in [(false, false, false), (false, true, false), (true, false, false), (true, true, false), (false, false, true), (false, true, true), (true, false, true), (true, true, true)] {
+        let mut rng = ChaChaRng::from_entropy();
+        let s0 = gen_s::<n>(&mut rng);
+        let s1 = gen_s::<kN>(&mut rng);
+        let ct1 = encrypt(v1, &s1);
+        let ct2 = encrypt(v2, &s1);
+        let ct3 = encrypt(v3, &s1);
+        let bk = gen_bk(s0, s1);
+        let ks = gen_ks(s0, s1);
+        let (ct_s, ct_c) = hom_full_adder(&ct1, &ct2, &ct3, &bk, &ks);
+        let pt_s = decrypt(&ct_s, &s1);
+        let pt_c = decrypt(&ct_c, &s1);
+        assert_eq!(v1 ^ v2 ^ v3, pt_s);
+        assert_eq!((v1 & v2) | (v1 & v3) | (v2 & v3), pt_c);
+    }
+}
+
 fn gen_bk(s0: [bool; n], s1: [bool; kN]) -> BKey {
     s0.map(|b| TRGSW::new(b as u32, s1))
 }
@@ -437,7 +455,7 @@ type Torus16 = u16;
 type Torus32 = u32;
 type TorusPoly = Box<[Torus32; N]>;
 type BKey = [TRGSW; n];
-type KSKey = [[[Box<TLWELv0>; base/2]; t]; kN];
+type KSKey = [[[Box<TLWELv0>; (1<<basebit)/2]; t]; kN];
 
 type TLWELv0 = TLWE<Torus16, n>;
 type TLWELv1 = TLWE<Torus32, kN>;
