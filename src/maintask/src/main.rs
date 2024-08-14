@@ -3,8 +3,14 @@
 mod ntt;
 
 use std::array;
+use std::f64::consts::PI;
 use std::ops::{Add, Sub};
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 use arrayref::array_ref;
+use concrete_fft::c64;
+use concrete_fft::ordered::{Method, Plan};
+use dyn_stack::{GlobalPodBuffer, PodStack, ReborrowMut};
 use num_traits::Unsigned;
 use rand::{Rng, RngCore};
 use rand::distributions::Standard;
@@ -98,6 +104,55 @@ fn decomposition_poly<const m: usize>(a: &TorusPoly) -> [[i8; N]; m] {
     r
 }
 
+static FFT: LazyLock<Mutex<FFT>> = LazyLock::new(|| {
+    let plan = Plan::new(N / 2, Method::Measure(Duration::from_millis(10)));
+    let scratch_memory = GlobalPodBuffer::new(plan.fft_scratch().unwrap());
+    Mutex::new(FFT {
+        plan,
+        scratch_memory,
+    })
+});
+struct FFT {
+    plan: Plan,
+    scratch_memory: GlobalPodBuffer,
+}
+impl FFT {
+    fn torus32_to_f64(a: Torus32) -> f64 {
+        a as f64 / 4294967296.
+    }
+    fn f64_to_torus32(a: f64) -> Torus32 {
+        (a * 4294967296.) as i64 as Torus32
+    }
+    fn polymul_i8(&mut self, a: &[i8; N], b: &TorusPoly) -> TorusPoly {
+        let mut stack = PodStack::new(&mut self.scratch_memory);
+        const h: usize = N/2;
+        let mut ac: [c64; h] = [Default::default(); h];
+        let mut bc: [c64; h] = [Default::default(); h];
+        for i in 0..h {
+            let w = c64::cis(PI * i as f64 / N as f64);
+            ac[i] = c64::new(a[i] as f64, a[i + h] as f64) * w;
+            bc[i] = c64::new(Self::torus32_to_f64(b[i]), Self::torus32_to_f64(b[i + h])) * w;
+        }
+        self.plan.fwd(&mut ac, stack.rb_mut());
+        self.plan.fwd(&mut bc, stack.rb_mut());
+        for i in 0..h {
+            ac[i] = ac[i] * bc[i];
+        }
+        self.plan.inv(&mut ac, stack.rb_mut());
+        let mut c = [0; N];
+        for i in 0..h {
+            let w = c64::cis(-PI * i as f64 / N as f64);
+            ac[i] *= w;
+            c[i] = Self::f64_to_torus32(ac[i].re / h as f64);
+            c[i + h] = Self::f64_to_torus32(ac[i].im / h as f64);
+        }
+        Box::new(c)
+    }
+    fn polymul_bool(&mut self, a: &[bool; N], b: &TorusPoly) -> TorusPoly {
+        self.polymul_i8(&a.map(|v| v as i8), b)
+    }
+}
+
 fn polymul_i8(a: &[i8; N], b: &TorusPoly) -> TorusPoly {
     let a: [i32; N] = a.map(|v| v as i32);
     let b: [i32; N] = b.map(|v| v as i32);
@@ -119,9 +174,10 @@ fn external_product(c: &TRGSW, trlwe: &TRLWE) -> TRLWE {
     let mut r = [[0; N]; 3];
     for i in 0..3 {
         for j in 0..l {
-            let mul0 = polymul_i8(&a0_decomp[j], &c.mat[j][i]);
-            let mul1 = polymul_i8(&a1_decomp[j], &c.mat[j+l][i]);
-            let mul2 = polymul_i8(&b_decomp[j], &c.mat[j+l+l][i]);
+            let mut fft = FFT.lock().unwrap();
+            let mul0 = fft.polymul_i8(&a0_decomp[j], &c.mat[j][i]);
+            let mul1 = fft.polymul_i8(&a1_decomp[j], &c.mat[j+l][i]);
+            let mul2 = fft.polymul_i8(&b_decomp[j], &c.mat[j+l+l][i]);
             for x in 0..N {
                 r[i][x] += mul0[x] + mul1[x] + mul2[x];
             }
@@ -342,11 +398,6 @@ impl<T, const M: usize> TLWE<T, M> {
         }
     }
 }
-impl<const M: usize> TLWE<Torus16, M> {
-    pub fn new_mu() -> Self {
-        Self::new([0; M], MU16)
-    }
-}
 impl<const M: usize> TLWE<Torus32, M> {
     pub fn new_mu() -> Self {
         Self::new([0; M], MU32)
@@ -413,8 +464,9 @@ impl TRLWE {
         let e: TorusPoly = Box::new(array::from_fn(|_| gen_cbd(&mut rng)));
         let s0 = array_ref!(s, 0, N);
         let s1 = array_ref!(s, N, N);
-        let as0 = polymul_bool(s0, &a0);
-        let as1 = polymul_bool(s1, &a1);
+        let mut fft = FFT.lock().unwrap();
+        let as0 = fft.polymul_bool(s0, &a0);
+        let as1 = fft.polymul_bool(s1, &a1);
         let mut b = [0; N];
         for i in 0..N {
             b[i] = as0[i] + as1[i] + e[i];
@@ -434,8 +486,9 @@ impl TRLWE {
         let e: TorusPoly = Box::new(array::from_fn(|_| gen_cbd(&mut rng)));
         let s0 = array_ref!(s, 0, N);
         let s1 = array_ref!(s, N, N);
-        let as0 = polymul_bool(s0, &a0);
-        let as1 = polymul_bool(s1, &a1);
+        let mut fft = FFT.lock().unwrap();
+        let as0 = fft.polymul_bool(s0, &a0);
+        let as1 = fft.polymul_bool(s1, &a1);
         let mut b = [0; N];
         for i in 0..N {
             b[i] = as0[i] + as1[i] + e[i] + poly[i];
@@ -445,8 +498,9 @@ impl TRLWE {
     fn decrypt(&self, s: &[bool; kN]) -> TorusPoly {
         let s0 = array_ref!(s, 0, N);
         let s1 = array_ref!(s, N, N);
-        let as0 = polymul_bool(s0, &self.a0);
-        let as1 = polymul_bool(s1, &self.a1);
+        let mut fft = FFT.lock().unwrap();
+        let as0 = fft.polymul_bool(s0, &self.a0);
+        let as1 = fft.polymul_bool(s1, &self.a1);
         let mut pt = [0; N];
         for i in 0..N {
             pt[i] = self.b[i] - as0[i] - as1[i];
