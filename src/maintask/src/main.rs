@@ -32,27 +32,28 @@ const Nbit: usize = 9;
 const n: usize = 636;
 
 fn  main() {
+    let mut rng = ChaChaRng::from_entropy();
+    let s0 = gen_s::<n>(&mut rng);
+    let s1 = gen_s::<kN>(&mut rng);
+    let bk = gen_bk(s0, s1);
+    let ks = gen_ks(s0, s1);
+    let timer_all = std::time::Instant::now();
     for itr in 0..50 {
         let timer = std::time::Instant::now();
         let v1 = (itr & 1) == 0;
         let v2 = (itr & 2) == 0;
         let v3 = (itr & 4) == 0;
-        let mut rng = ChaChaRng::from_entropy();
-        let s0 = gen_s::<n>(&mut rng);
-        let s1 = gen_s::<kN>(&mut rng);
         let ct1 = encrypt(v1, &s1);
         let ct2 = encrypt(v2, &s1);
         let ct3 = encrypt(v3, &s1);
-        let bk = gen_bk(s0, s1);
-        let ks = gen_ks(s0, s1);
         let (ct_s, ct_c) = hom_full_adder(&ct1, &ct2, &ct3, &bk, &ks);
         let pt_s = decrypt(&ct_s, &s1);
         let pt_c = decrypt(&ct_c, &s1);
         assert_eq!(v1 ^ v2 ^ v3, pt_s);
         assert_eq!((v1 & v2) | (v1 & v3) | (v2 & v3), pt_c);
-        println!("{:?}: {:?} + {:?} + {:?} = {:?} {:?}", itr, v1, v2, v3, pt_c, pt_s);
-        println!("{:?}", timer.elapsed());
+        println!("{:?} | {}: {} + {} + {} = {} {}", timer.elapsed(), itr, v1, v2, v3, pt_c, pt_s);
     }
+    println!("{:?}", timer_all.elapsed());
 }
 
 fn torus32_to_16(a: Torus32) -> Torus16 {
@@ -69,7 +70,7 @@ fn sample_extract_index(trlwe: &TRLWE, x: usize) -> TLWELv1 {
         a[j] = trlwe.a0[N + x - j].wrapping_neg();
         a[N + j] = trlwe.a1[N + x - j].wrapping_neg();
     }
-    TLWELv1::new(a, trlwe.b[x])
+    TLWELv1::new(Box::new(a), trlwe.b[x])
 }
 
 #[test]
@@ -280,7 +281,7 @@ fn test_gate_bootstrapping_tlwe_to_tlwe() {
 }
 
 fn identity_key_switching(tlwe: &TLWELv1, ks: &KSKey) -> TLWELv0 {
-    let mut r = TLWELv0::new([0; n], torus32_to_16(tlwe.b));
+    let mut r = TLWELv0::new(Box::new([0; n]), torus32_to_16(tlwe.b));
     for i in 0..kN {
         let a2 = tlwe.a[i] as i64 + (1 << (31 - t * basebit)) + 0xaa800000;
         for m in 0..t {
@@ -397,8 +398,8 @@ fn gen_ks(s0: [bool; n], s1: [bool; kN]) -> KSKey {
     })
 }
 
-fn gen_nonce<T, const m: usize>(rng: &mut ChaChaRng) -> [T; m] where Standard: Distribution<T> {
-    [0; m].map(|_| rng.gen())
+fn gen_nonce<T, const m: usize>(rng: &mut ChaChaRng) -> Box<[T; m]> where Standard: Distribution<T> {
+    Box::new([0; m].map(|_| rng.gen()))
 }
 
 fn gen_cbd(rng: &mut ChaChaRng) -> Torus32 {
@@ -461,11 +462,11 @@ type TLWELv0 = TLWE<Torus16, n>;
 type TLWELv1 = TLWE<Torus32, kN>;
 #[derive(Debug)]
 struct TLWE<T, const M: usize> {
-    a: [T; M],
+    a: Box<[T; M]>,
     b: T,
 }
 impl<T, const M: usize> TLWE<T, M> {
-    pub fn new(a: [T; M], b: T) -> Self {
+    pub fn new(a: Box<[T; M]>, b: T) -> Self {
         Self {
             a,
             b,
@@ -474,7 +475,7 @@ impl<T, const M: usize> TLWE<T, M> {
 }
 impl<const M: usize> TLWE<Torus32, M> {
     pub fn new_const(x: Torus32) -> Self {
-        Self::new([0; M], x)
+        Self::new(Box::new([0; M]), x)
     }
 }
 impl<'a, 'b, T, const M: usize> Add<&'b TLWE<T, M>> for &'a TLWE<T, M> where T: Unsigned + Copy + Default {
@@ -485,7 +486,7 @@ impl<'a, 'b, T, const M: usize> Add<&'b TLWE<T, M>> for &'a TLWE<T, M> where T: 
         for i in 0..M {
             a[i] = self.a[i] + rhs.a[i];
         }
-        TLWE::new(a, self.b + rhs.b)
+        TLWE::new(Box::new(a), self.b + rhs.b)
     }
 }
 impl<'a, 'b, T, const M: usize> Sub<&'b TLWE<T, M>> for &'a TLWE<T, M> where T: Unsigned + Copy + Default {
@@ -496,7 +497,7 @@ impl<'a, 'b, T, const M: usize> Sub<&'b TLWE<T, M>> for &'a TLWE<T, M> where T: 
         for i in 0..M {
             a[i] = self.a[i] - rhs.a[i];
         }
-        TLWE::new(a, self.b - rhs.b)
+        TLWE::new(Box::new(a), self.b - rhs.b)
     }
 }
 impl<'a, T, const M: usize> Mul<T> for &'a TLWE<T, M> where T: Unsigned + Copy + Default {
@@ -507,7 +508,7 @@ impl<'a, T, const M: usize> Mul<T> for &'a TLWE<T, M> where T: Unsigned + Copy +
         for i in 0..M {
             a[i] = self.a[i] * rhs;
         }
-        TLWE::new(a, self.b * rhs)
+        TLWE::new(Box::new(a), self.b * rhs)
     }
 }
 
@@ -544,8 +545,8 @@ impl TRLWE {
     }
     pub fn new_zero(s: [bool; kN]) -> Self {
         let mut rng = ChaChaRng::from_entropy();
-        let a0 = Box::new(gen_nonce::<Torus32, N>(&mut rng));
-        let a1 = Box::new(gen_nonce::<Torus32, N>(&mut rng));
+        let a0 = gen_nonce::<Torus32, N>(&mut rng);
+        let a1 = gen_nonce::<Torus32, N>(&mut rng);
         let e: TorusPoly = Box::new(array::from_fn(|_| gen_cbd(&mut rng)));
         let s0 = array_ref!(s, 0, N);
         let s1 = array_ref!(s, N, N);
@@ -566,8 +567,8 @@ impl TRLWE {
     }
     pub fn encrypt(poly: &TorusPoly, s: [bool; kN]) -> Self {
         let mut rng = ChaChaRng::from_entropy();
-        let a0 = Box::new(gen_nonce::<Torus32, N>(&mut rng));
-        let a1 = Box::new(gen_nonce::<Torus32, N>(&mut rng));
+        let a0 = gen_nonce::<Torus32, N>(&mut rng);
+        let a1 = gen_nonce::<Torus32, N>(&mut rng);
         let e: TorusPoly = Box::new(array::from_fn(|_| gen_cbd(&mut rng)));
         let s0 = array_ref!(s, 0, N);
         let s1 = array_ref!(s, N, N);
