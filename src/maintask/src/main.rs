@@ -171,6 +171,7 @@ impl FFT {
     }
 }
 
+#[allow(unused)]
 fn polymul_i8(a: &[i8; N], b: &TorusPoly) -> TorusPoly {
     let a: [i32; N] = a.map(|v| v as i32);
     let b: [i32; N] = b.map(|v| v as i32);
@@ -178,6 +179,7 @@ fn polymul_i8(a: &[i8; N], b: &TorusPoly) -> TorusPoly {
     Box::new(c.map(|v| v as Torus32))
 }
 
+#[allow(unused)]
 fn polymul_bool(a: &[bool; N], b: &TorusPoly) -> TorusPoly {
     let a: [i32; N] = a.map(|v| v as i32);
     let b: [i32; N] = b.map(|v| v as i32);
