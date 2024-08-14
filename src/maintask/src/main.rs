@@ -4,7 +4,7 @@ mod ntt;
 
 use std::array;
 use std::f64::consts::PI;
-use std::ops::{Add, Sub};
+use std::ops::{Add, DerefMut, Sub};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use arrayref::array_ref;
@@ -23,6 +23,7 @@ const MU32: Torus32 = 1 << 29;
 const ETA: usize = 40;
 const k: usize = 2;
 const N: usize = 512;
+const h: usize = N/2;
 const kN: usize = k * N;
 const l: usize = 2;
 const t: usize = 5;
@@ -51,7 +52,7 @@ fn  main() {
 }
 
 fn torus32_to_16(a: Torus32) -> Torus16 {
-    (a >> 16) as u16
+    (a + 0x8000 >> 16) as u16
 }
 
 fn sample_extract_index(trlwe: &TRLWE, x: usize) -> TLWELv1 {
@@ -116,6 +117,7 @@ struct FFT {
     plan: Plan,
     scratch_memory: GlobalPodBuffer,
 }
+type TorusPolyFFT = Box<[c64; h]>;
 impl FFT {
     fn torus32_to_f64(a: Torus32) -> f64 {
         a as f64 / 4294967296.
@@ -123,22 +125,19 @@ impl FFT {
     fn f64_to_torus32(a: f64) -> Torus32 {
         (a * 4294967296.) as i64 as Torus32
     }
-    fn polymul_i8(&mut self, a: &[i8; N], b: &TorusPoly) -> TorusPoly {
+    fn fft(&mut self, a: &TorusPoly) -> TorusPolyFFT {
         let mut stack = PodStack::new(&mut self.scratch_memory);
-        const h: usize = N/2;
         let mut ac: [c64; h] = [Default::default(); h];
-        let mut bc: [c64; h] = [Default::default(); h];
         for i in 0..h {
             let w = c64::cis(PI * i as f64 / N as f64);
-            ac[i] = c64::new(a[i] as f64, a[i + h] as f64) * w;
-            bc[i] = c64::new(Self::torus32_to_f64(b[i]), Self::torus32_to_f64(b[i + h])) * w;
+            ac[i] = c64::new(Self::torus32_to_f64(a[i]), Self::torus32_to_f64(a[i + h])) * w;
         }
         self.plan.fwd(&mut ac, stack.rb_mut());
-        self.plan.fwd(&mut bc, stack.rb_mut());
-        for i in 0..h {
-            ac[i] = ac[i] * bc[i];
-        }
-        self.plan.inv(&mut ac, stack.rb_mut());
+        Box::new(ac)
+    }
+    fn ifft(&mut self, ac: &mut TorusPolyFFT) -> TorusPoly {
+        let mut stack = PodStack::new(&mut self.scratch_memory);
+        self.plan.inv(ac.deref_mut(), stack.rb_mut());
         let mut c = [0; N];
         for i in 0..h {
             let w = c64::cis(-PI * i as f64 / N as f64);
@@ -148,8 +147,22 @@ impl FFT {
         }
         Box::new(c)
     }
+    fn polymul_i8(&mut self, a: &[i8; N], bc: &TorusPolyFFT) -> TorusPolyFFT {
+        let mut stack = PodStack::new(&mut self.scratch_memory);
+        let mut ac: [c64; h] = array::from_fn(|i| {
+            let w = c64::cis(PI * i as f64 / N as f64);
+            c64::new(a[i] as f64, a[i + h] as f64) * w
+        });
+        self.plan.fwd(&mut ac, stack.rb_mut());
+        for i in 0..h {
+            ac[i] = ac[i] * bc[i];
+        }
+        Box::new(ac)
+    }
     fn polymul_bool(&mut self, a: &[bool; N], b: &TorusPoly) -> TorusPoly {
-        self.polymul_i8(&a.map(|v| v as i8), b)
+        let bc = self.fft(b);
+        let mut ac = self.polymul_i8(&a.map(|v| v as i8), &bc);
+        self.ifft(&mut ac)
     }
 }
 
@@ -171,22 +184,22 @@ fn external_product(c: &TRGSW, trlwe: &TRLWE) -> TRLWE {
     let a0_decomp = decomposition_poly::<l>(&trlwe.a0);
     let a1_decomp = decomposition_poly::<l>(&trlwe.a1);
     let b_decomp = decomposition_poly::<l>(&trlwe.b);
-    let mut r = [[0; N]; 3];
+    let mut r: [[c64; h]; 3] = [[Default::default(); h]; 3];
+    let mut fft = FFT.lock().unwrap();
     for i in 0..3 {
         for j in 0..l {
-            let mut fft = FFT.lock().unwrap();
             let mul0 = fft.polymul_i8(&a0_decomp[j], &c.mat[j][i]);
             let mul1 = fft.polymul_i8(&a1_decomp[j], &c.mat[j+l][i]);
             let mul2 = fft.polymul_i8(&b_decomp[j], &c.mat[j+l+l][i]);
-            for x in 0..N {
+            for x in 0..h {
                 r[i][x] += mul0[x] + mul1[x] + mul2[x];
             }
         }
     }
     TRLWE {
-        a0: Box::new(r[0]),
-        a1: Box::new(r[1]),
-        b: Box::new(r[2]),
+        a0: fft.ifft(&mut Box::new(r[0])),
+        a1: fft.ifft(&mut Box::new(r[1])),
+        b: fft.ifft(&mut Box::new(r[2])),
     }
 }
 
@@ -260,15 +273,16 @@ fn test_gate_bootstrapping_tlwe_to_tlwe() {
     }
 }
 
-fn identity_key_switching(tlwe: &TLWELv1, ks: [[[Box<TLWELv0>; base-1]; t]; kN]) -> TLWELv0 {
+fn identity_key_switching(tlwe: &TLWELv1, ks: [[[Box<TLWELv0>; base/2]; t]; kN]) -> TLWELv0 {
     let mut r = TLWELv0::new([0; n], torus32_to_16(tlwe.b));
-    let mask = (base - 1) as u32;
     for i in 0..kN {
+        let a2 = tlwe.a[i] as i64 + (1 << (31 - t * basebit)) + 0xaa800000;
         for m in 0..t {
-            let sh = 32 - (m + 1) * basebit;
-            let o = ((tlwe.a[i] + (1 << (31 - t * basebit))) >> sh & mask) as usize;
+            let o = ((a2 >> (32 - (m + 1) * basebit) & 3) - 2) as i8;
             if o > 0 {
-                r = &r - &ks[i][m][o-1];
+                r = &r - &ks[i][m][(o-1) as usize];
+            } else if o < 0 {
+                r = &r + &ks[i][m][(-o-1) as usize];
             }
         }
     }
@@ -289,7 +303,7 @@ fn test_identity_key_switching() {
     }
 }
 
-fn hom_nand(x: &TLWELv1, y: &TLWELv1, bk: &[TRGSW; n], ks: [[[Box<TLWELv0>; base-1]; t]; kN]) -> TLWELv1 {
+fn hom_nand(x: &TLWELv1, y: &TLWELv1, bk: &[TRGSW; n], ks: [[[Box<TLWELv0>; base/2]; t]; kN]) -> TLWELv1 {
     let lv1 = &(&TLWELv1::new_mu() - x) - y;
     let lv0 = identity_key_switching(&lv1, ks);
     gate_bootstrapping_tlwe_to_tlwe(&lv0, bk)
@@ -313,7 +327,7 @@ fn gen_bk(s0: [bool; n], s1: [bool; kN]) -> [TRGSW; n] {
     s0.map(|b| TRGSW::new(b as u32, s1))
 }
 
-fn gen_ks(s0: [bool; n], s1: [bool; kN]) -> [[[Box<TLWELv0>; base-1]; t]; kN] {
+fn gen_ks(s0: [bool; n], s1: [bool; kN]) -> [[[Box<TLWELv0>; base/2]; t]; kN] {
     array::from_fn(|i| {
         array::from_fn(|m| {
             let sh = 16 - (m + 1) * basebit;
@@ -540,19 +554,22 @@ impl <'a, 'b> Sub<&'b TRLWE> for &'a TRLWE {
 }
 
 struct TRGSW {
-    mat: [[TorusPoly; 3]; l * 3],
+    mat: [[TorusPolyFFT; 3]; l * 3],
 }
 impl TRGSW {
     pub fn new(mu: u32, s: [bool; kN]) -> Self {
-        let mut mat = array::from_fn(|_| {
-            let zero_enc = TRLWE::new_zero(s);
-            [zero_enc.a0, zero_enc.a1, zero_enc.b]
+        let mat = array::from_fn(|i| {
+            let mut zero_enc = TRLWE::new_zero(s);
+            if i < l {
+                zero_enc.a0[0] += mu << (24 - i * 8);
+            } else if i < l * 2 {
+                zero_enc.a1[0] += mu << (24 - (i-l) * 8);
+            } else {
+                zero_enc.b[0] += mu << (24 - (i-l-l) * 8);
+            }
+            let mut fft = FFT.lock().unwrap();
+            [fft.fft(&zero_enc.a0), fft.fft(&zero_enc.a1), fft.fft(&zero_enc.b)]
         });
-        for i in 0..l {
-            mat[i][0][0] += mu << (24 - i * 8);
-            mat[i+l][1][0] += mu << (24 - i * 8);
-            mat[i+l+l][2][0] += mu << (24 - i * 8);
-        }
         TRGSW {
             mat,
         }
